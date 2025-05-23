@@ -14,20 +14,24 @@ const io = new Server(httpServer, {
   }
 });
 
-// ========== Game State ==========
+// ========== Game State ===========
 const rooms = {};         // { roomCode: [socket.id, ...] }
-const players = {};       // { socket.id: { name, roomCode, host? } }
+const players = {};       // { socket.id: { name, roomCode, host?, cards: [], revealed: [], food } }
 const readyStatus = {};   // { roomCode: Set(socket.id, ...) }
 
+// Role deck (3 copies of each animal)
 const ROLE_DECK = [
-  "Lion", "Lion", "Lion",
-  "Cobra", "Cobra", "Cobra",
-  "Raven", "Raven", "Raven",
-  "Owl", "Owl", "Owl",
-  "Panther", "Panther", "Panther"
+  "Lion","Lion","Lion",
+  "Cobra","Cobra","Cobra",
+  "Raven","Raven","Raven",
+  "Owl","Owl","Owl",
+  "Panther","Panther","Panther"
 ];
 
-// ========== Helpers ==========
+// Persistent shuffled deck per room
+const roomDecks = {};     // { roomCode: [...cards] }
+
+// ========== Helpers ===========
 function generateRoomCode() {
   let code;
   do {
@@ -47,7 +51,36 @@ function getNonHostPlayerCount(roomCode) {
   return socketIds.filter(id => !players[id]?.host).length;
 }
 
-// ========== Socket Events ==========
+// Fisher–Yates shuffle
+function shuffle(deck) {
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+}
+
+// Reveal one of the player’s cards without replacing it
+function loseCard(socketId, cardIndex) {
+  const player   = players[socketId];
+  const roomCode = player.roomCode;
+
+  // Remove that card from hidden hand
+  const [lost] = player.cards.splice(cardIndex, 1);
+
+  // Track it as revealed (face-up)
+  player.revealed.push(lost);
+
+  // Notify the affected player
+  io.to(socketId).emit("cardLost", lost);
+
+  // Broadcast to room who lost which animal
+  io.to(roomCode).emit("playerLostCard", {
+    playerId:   socketId,
+    lostAnimal: lost
+  });
+}
+
+// ========== Socket Events ===========
 io.on("connection", (socket) => {
 
   // --- Room Creation ---
@@ -94,7 +127,7 @@ io.on("connection", (socket) => {
 
     if (hostId) {
       io.to(hostId).emit("readyUpdate", {
-        names: readyNames,
+        names:    readyNames,
         allReady: readyCount === requiredReadyCount
       });
     }
@@ -109,11 +142,8 @@ io.on("connection", (socket) => {
     const room = rooms[roomCode];
 
     if (room) {
-      // Remove from room and ready list
       rooms[roomCode] = room.filter(id => id !== socket.id);
-      if (readyStatus[roomCode]) {
-        readyStatus[roomCode].delete(socket.id);
-      }
+      if (readyStatus[roomCode]) readyStatus[roomCode].delete(socket.id);
 
       delete players[socket.id];
       emitRoomPlayers(roomCode);
@@ -125,7 +155,7 @@ io.on("connection", (socket) => {
         const requiredReady = getNonHostPlayerCount(roomCode);
 
         io.to(hostId).emit("readyUpdate", {
-          names: readyNames,
+          names:    readyNames,
           allReady: readyCount === requiredReady
         });
       }
@@ -140,18 +170,26 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const sockets = rooms[roomCode];
-    if (!sockets) return;
+    const socketsArr = rooms[roomCode];
+    if (!socketsArr) return;
 
-    // Shuffle and assign roles
-    const shuffled = [...ROLE_DECK].sort(() => Math.random() - 0.5);
-    const assignments = {};
-    sockets.forEach((socketId) => {
-      assignments[socketId] = [shuffled.pop(), shuffled.pop()];
+    // Build & shuffle deck for this room
+    const deck = [...ROLE_DECK];
+    shuffle(deck);
+    roomDecks[roomCode] = deck;
+
+    // Deal 2 cards to each player & init revealed and food
+    socketsArr.forEach((id) => {
+      const card1 = deck.pop();
+      const card2 = deck.pop();
+      players[id].cards    = [card1, card2];
+      players[id].revealed = [];
+      players[id].food     = 2;
     });
 
-    Object.entries(assignments).forEach(([id, roles]) => {
-      io.to(id).emit("yourRoles", roles);
+    // Emit private roles
+    socketsArr.forEach((id) => {
+      io.to(id).emit("yourRoles", players[id].cards);
     });
 
     // Determine first hunter via d20 roll
@@ -159,7 +197,7 @@ io.on("connection", (socket) => {
     let highest = 0;
     let firstHunterId = null;
 
-    sockets.forEach((id) => {
+    socketsArr.forEach((id) => {
       const roll = Math.floor(Math.random() * 20) + 1;
       rolls[id] = roll;
       if (roll > highest) {
@@ -173,37 +211,40 @@ io.on("connection", (socket) => {
     });
 
     io.to(roomCode).emit("firstHunt", {
-      playerId: firstHunterId,
+      playerId:   firstHunterId,
       playerName: players[firstHunterId]?.name || "Unknown"
     });
 
-    // Initialize food
-    const playerFood = {};
-    let sharedFood = 50;
-
-    sockets.forEach((id) => {
-      playerFood[id] = 2;
-    });
-
-    sockets.forEach((id) => {
+    // Initialize shared & player food
+    const sharedFood = 50;
+    socketsArr.forEach((id) => {
       io.to(id).emit("initFood", {
-        yourFood: playerFood[id],
+        yourFood:     players[id].food,
         sharedFood,
-        playerFoods: sockets.map(pid => ({
+        playerFoods:  socketsArr.map(pid => ({
           name: players[pid].name,
-          food: playerFood[pid]
+          food: players[pid].food
         }))
       });
     });
 
-    // Clear readiness
+    // Clear ready status and notify game start
     delete readyStatus[roomCode];
-
     io.to(roomCode).emit("gameStarted");
   });
+
+  // --- Example action hooks for lose life ---
+  socket.on("assassinate", ({ targetId, cardIndex }) => {
+    loseCard(targetId, cardIndex);
+  });
+
+  socket.on("coup", ({ targetId, cardIndex }) => {
+    loseCard(targetId, cardIndex);
+  });
+
 });
 
-// ========== Server Start ==========
+// ========== Server Start ===========
 httpServer.listen(3001, () => {
   console.log("Server listening on port 3001");
 });
