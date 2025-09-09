@@ -1,4 +1,4 @@
-# 🕵️‍♂️ Coup Clone – Multiplayer Browser Game
+# 🕵️‍♂️ Predator's Bluff (Similar Game to Coup) – Multiplayer Browser Game (BETA)
 
 A real-time, browser-based party card game inspired by *Coup*. Bluff, strategize, and eliminate your opponents in a game of deception and deduction.
 
